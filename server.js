@@ -40,7 +40,7 @@ const oauth2Client = new OAuth2Client(GOOGLE_CLIENT_ID, GOOGLE_CLIENT_SECRET, RE
 const youtube = google.youtube({ version: 'v3', auth: YOUTUBE_API_KEY });
 
 // ─── Middleware ────────────────────────────────────────────────────────────────
-app.use(cors({ origin: 'http://localhost:3000', credentials: true }));
+app.use(cors({ origin: ['http://localhost:3000', 'https://nova-music-frontend.vercel.app'], credentials: true }));
 app.use(express.json());
 app.use(session({
   secret: SESSION_SECRET,
