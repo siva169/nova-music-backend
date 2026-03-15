@@ -39,14 +39,32 @@ const oauth2Client = new OAuth2Client(GOOGLE_CLIENT_ID, GOOGLE_CLIENT_SECRET, RE
 const youtube = google.youtube({ version: 'v3', auth: YOUTUBE_API_KEY });
 
 // ─── Middleware ────────────────────────────────────────────────────────────────
-app.use(cors({ origin: ['http://localhost:3000', 'https://nova-music-frontend.vercel.app'], credentials: true }));
+const allowedOrigins = ['http://localhost:3000', 'https://nova-music-frontend.vercel.app'];
+app.use(cors({
+  origin: function(origin, callback) {
+    if (!origin || allowedOrigins.includes(origin)) callback(null, true);
+    else callback(new Error('Not allowed by CORS'));
+  },
+  credentials: true,
+  methods: ['GET', 'POST', 'PUT', 'DELETE', 'OPTIONS'],
+  allowedHeaders: ['Content-Type', 'Authorization', 'Cookie'],
+}));
+app.options('*', cors());
 app.use(express.json());
+app.set('trust proxy', 1);
 app.use(session({
   secret: SESSION_SECRET,
-  resave: false,
-  saveUninitialized: false,
-  cookie: { secure: true, sameSite: 'none', maxAge: 30 * 24 * 60 * 60 * 1000 }
+  resave: true,
+  saveUninitialized: true,
+  proxy: true,
+  cookie: {
+    secure: true,
+    sameSite: 'none',
+    maxAge: 30 * 24 * 60 * 60 * 1000,
+    httpOnly: true
+  }
 }));
+
 
 function requireAuth(req, res, next) {
   if (!req.session.user) return res.status(401).json({ error: 'Unauthorized' });
