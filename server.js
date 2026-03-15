@@ -524,7 +524,7 @@ app.get('/api/stream8d/:videoId', requireAuth, async (req, res) => {
 });
 
 // ─── Start ─────────────────────────────────────────────────────────────────────
-const PORT = process.env.PORT || 3001;
+const PORT = process.env.PORT || 3000;
 app.listen(PORT, () => {
   console.log(`\n🎵 NOVA Backend running on http://localhost:${PORT}`);
   console.log(`📋 Configure your API keys in .env file\n`);
