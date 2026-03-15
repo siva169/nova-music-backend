@@ -1,4 +1,3 @@
-import 'dotenv/config';
 import express from 'express';
 import cors from 'cors';
 import session from 'express-session';
@@ -33,7 +32,7 @@ function saveData(data) {
 const GOOGLE_CLIENT_ID = process.env.GOOGLE_CLIENT_ID || 'YOUR_GOOGLE_CLIENT_ID';
 const GOOGLE_CLIENT_SECRET = process.env.GOOGLE_CLIENT_SECRET || 'YOUR_GOOGLE_CLIENT_SECRET';
 const YOUTUBE_API_KEY = process.env.YOUTUBE_API_KEY || 'YOUR_YOUTUBE_API_KEY';
-const REDIRECT_URI = 'http://localhost:3001/auth/google/callback';
+const REDIRECT_URI = 'https://nova-music-backend-production.up.railway.app/auth/google/callback';
 const SESSION_SECRET = process.env.SESSION_SECRET || 'nova-music-secret-2024';
 
 const oauth2Client = new OAuth2Client(GOOGLE_CLIENT_ID, GOOGLE_CLIENT_SECRET, REDIRECT_URI);
@@ -46,7 +45,7 @@ app.use(session({
   secret: SESSION_SECRET,
   resave: false,
   saveUninitialized: false,
-  cookie: { secure: false, maxAge: 30 * 24 * 60 * 60 * 1000 }
+  cookie: { secure: true, sameSite: 'none', maxAge: 30 * 24 * 60 * 60 * 1000 }
 }));
 
 function requireAuth(req, res, next) {
@@ -88,10 +87,10 @@ app.get('/auth/google/callback', async (req, res) => {
       saveData(db);
     }
     req.session.user = { id: payload.sub, name: payload.name, email: payload.email, picture: payload.picture };
-    res.redirect('http://localhost:3000/home');
+    res.redirect('https://nova-music-frontend.vercel.app/home');
   } catch (err) {
     console.error(err);
-    res.redirect('http://localhost:3000/?error=auth_failed');
+    res.redirect('https://nova-music-frontend.vercel.app/?error=auth_failed');
   }
 });
 
@@ -339,7 +338,7 @@ app.post('/api/playlists/:id/share', requireAuth, (req, res) => {
   playlist.isPublic = true;
   if (!playlist.shareId) playlist.shareId = uuidv4();
   saveData(db);
-  res.json({ shareUrl: `http://localhost:3000/shared/${playlist.shareId}`, shareId: playlist.shareId });
+  res.json({ shareUrl: `https://nova-music-frontend.vercel.app/shared/${playlist.shareId}`, shareId: playlist.shareId });
 });
 
 app.get('/api/shared/:shareId', (req, res) => {
@@ -524,7 +523,7 @@ app.get('/api/stream8d/:videoId', requireAuth, async (req, res) => {
 });
 
 // ─── Start ─────────────────────────────────────────────────────────────────────
-const PORT = process.env.PORT || 3000;
+const PORT = process.env.PORT || 3001;
 app.listen(PORT, () => {
   console.log(`\n🎵 NOVA Backend running on http://localhost:${PORT}`);
   console.log(`📋 Configure your API keys in .env file\n`);
