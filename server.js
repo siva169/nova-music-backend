@@ -1,3 +1,4 @@
+import 'dotenv/config';
 import express from 'express';
 import cors from 'cors';
 import session from 'express-session';
@@ -8,38 +9,47 @@ import { v4 as uuidv4 } from 'uuid';
 import fs from 'fs';
 import path from 'path';
 import { fileURLToPath } from 'url';
+import https from 'https';
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 const app = express();
 const cache = new NodeCache({ stdTTL: 3600 });
 const DATA_FILE = path.join(__dirname, 'data.json');
 
-// ─── In-memory DB (file-backed) ───────────────────────────────────────────────
 function loadData() {
   if (!fs.existsSync(DATA_FILE)) {
     const init = { users: {}, playlists: {}, sharedPlaylists: {} };
     fs.writeFileSync(DATA_FILE, JSON.stringify(init, null, 2));
     return init;
   }
-  return JSON.parse(fs.readFileSync(DATA_FILE, 'utf8'));
+  try { return JSON.parse(fs.readFileSync(DATA_FILE, 'utf8')); }
+  catch { return { users: {}, playlists: {}, sharedPlaylists: {} }; }
 }
 
 function saveData(data) {
   fs.writeFileSync(DATA_FILE, JSON.stringify(data, null, 2));
 }
 
-// ─── Config ───────────────────────────────────────────────────────────────────
-const GOOGLE_CLIENT_ID = process.env.GOOGLE_CLIENT_ID || 'YOUR_GOOGLE_CLIENT_ID';
-const GOOGLE_CLIENT_SECRET = process.env.GOOGLE_CLIENT_SECRET || 'YOUR_GOOGLE_CLIENT_SECRET';
-const YOUTUBE_API_KEY = process.env.YOUTUBE_API_KEY || 'YOUR_YOUTUBE_API_KEY';
-const REDIRECT_URI = 'https://nova-music-backend-production.up.railway.app/auth/google/callback';
-const SESSION_SECRET = process.env.SESSION_SECRET || 'nova-music-secret-2024';
+const GOOGLE_CLIENT_ID = process.env.GOOGLE_CLIENT_ID || '';
+const GOOGLE_CLIENT_SECRET = process.env.GOOGLE_CLIENT_SECRET || '';
+const YOUTUBE_API_KEY = process.env.YOUTUBE_API_KEY || '';
+const REDIRECT_URI = process.env.NODE_ENV === 'production'
+  ? 'https://nova-music-backend-production.up.railway.app/auth/google/callback'
+  : 'http://localhost:3001/auth/google/callback';
+const FRONTEND_URL = process.env.NODE_ENV === 'production'
+  ? 'https://nova-music-frontend.vercel.app'
+  : 'http://localhost:3000';
+const SESSION_SECRET = process.env.SESSION_SECRET || 'nova_secret_2024';
 
 const oauth2Client = new OAuth2Client(GOOGLE_CLIENT_ID, GOOGLE_CLIENT_SECRET, REDIRECT_URI);
 const youtube = google.youtube({ version: 'v3', auth: YOUTUBE_API_KEY });
 
 // ─── Middleware ────────────────────────────────────────────────────────────────
-const allowedOrigins = ['http://localhost:3000', 'https://nova-music-frontend.vercel.app'];
+const allowedOrigins = [
+  'http://localhost:3000',
+  'https://nova-music-frontend.vercel.app'
+];
+
 app.use(cors({
   origin: function(origin, callback) {
     if (!origin || allowedOrigins.includes(origin)) callback(null, true);
@@ -64,7 +74,6 @@ app.use(session({
     httpOnly: true
   }
 }));
-
 
 function requireAuth(req, res, next) {
   if (!req.session.user) return res.status(401).json({ error: 'Unauthorized' });
@@ -94,21 +103,18 @@ app.get('/auth/google/callback', async (req, res) => {
     const db = loadData();
     if (!db.users[payload.sub]) {
       db.users[payload.sub] = {
-        id: payload.sub,
-        name: payload.name,
-        email: payload.email,
-        picture: payload.picture,
-        theme: 'dark',
-        accent: 'cyan',
+        id: payload.sub, name: payload.name,
+        email: payload.email, picture: payload.picture,
+        theme: 'dark', accent: 'cyan',
         createdAt: new Date().toISOString()
       };
       saveData(db);
     }
     req.session.user = { id: payload.sub, name: payload.name, email: payload.email, picture: payload.picture };
-    res.redirect('https://nova-music-frontend.vercel.app/home');
+    req.session.save(() => res.redirect(`${FRONTEND_URL}/home`));
   } catch (err) {
-    console.error(err);
-    res.redirect('https://nova-music-frontend.vercel.app/?error=auth_failed');
+    console.error('Auth error:', err);
+    res.redirect(`${FRONTEND_URL}/?error=auth_failed`);
   }
 });
 
@@ -134,16 +140,11 @@ app.get('/api/search', async (req, res) => {
   if (cached) return res.json(cached);
 
   try {
-    const params = {
-      part: 'snippet',
-      q,
-      type: 'video',
-      maxResults: 20,
-      order: 'relevance',
-      videoCategoryId: type === 'music' ? '10' : undefined,
+    const response = await youtube.search.list({
+      part: 'snippet', q, type: 'video',
+      maxResults: 20, order: 'relevance',
       pageToken: pageToken || undefined
-    };
-    const response = await youtube.search.list(params);
+    });
     const items = response.data.items.map(item => ({
       id: item.id.videoId,
       title: item.snippet.title,
@@ -157,36 +158,28 @@ app.get('/api/search', async (req, res) => {
     cache.set(cacheKey, result);
     res.json(result);
   } catch (err) {
-    console.error('YouTube search error:', err.message);
     res.status(500).json({ error: 'Search failed', message: err.message });
   }
 });
 
-// Search by channel
 app.get('/api/search/channel', async (req, res) => {
   const { channelName, pageToken } = req.query;
   if (!channelName) return res.json({ items: [] });
-
   try {
-    // First find the channel
     const channelRes = await youtube.search.list({
       part: 'snippet', q: channelName, type: 'channel', maxResults: 1
     });
     if (!channelRes.data.items?.length) return res.json({ items: [] });
-
     const channelId = channelRes.data.items[0].id.channelId;
     const videosRes = await youtube.search.list({
       part: 'snippet', channelId, type: 'video', maxResults: 20,
       order: 'date', pageToken: pageToken || undefined
     });
     const items = videosRes.data.items.map(item => ({
-      id: item.id.videoId,
-      title: item.snippet.title,
-      channel: item.snippet.channelTitle,
-      channelId: item.snippet.channelId,
+      id: item.id.videoId, title: item.snippet.title,
+      channel: item.snippet.channelTitle, channelId: item.snippet.channelId,
       thumbnail: item.snippet.thumbnails?.high?.url,
-      publishedAt: item.snippet.publishedAt,
-      description: item.snippet.description
+      publishedAt: item.snippet.publishedAt
     }));
     res.json({ items, nextPageToken: videosRes.data.nextPageToken || null });
   } catch (err) {
@@ -194,28 +187,20 @@ app.get('/api/search/channel', async (req, res) => {
   }
 });
 
-// Get trending / new releases
 app.get('/api/trending', async (req, res) => {
   const cacheKey = 'trending_music';
   const cached = cache.get(cacheKey);
   if (cached) return res.json(cached);
-
   try {
     const response = await youtube.videos.list({
-      part: 'snippet,statistics',
-      chart: 'mostPopular',
-      videoCategoryId: '10',
-      maxResults: 24,
-      regionCode: 'IN'
+      part: 'snippet,statistics', chart: 'mostPopular',
+      videoCategoryId: '10', maxResults: 24, regionCode: 'IN'
     });
     const items = response.data.items.map(item => ({
-      id: item.id,
-      title: item.snippet.title,
-      channel: item.snippet.channelTitle,
-      channelId: item.snippet.channelId,
+      id: item.id, title: item.snippet.title,
+      channel: item.snippet.channelTitle, channelId: item.snippet.channelId,
       thumbnail: item.snippet.thumbnails?.high?.url,
-      publishedAt: item.snippet.publishedAt,
-      viewCount: item.statistics?.viewCount
+      publishedAt: item.snippet.publishedAt, viewCount: item.statistics?.viewCount
     }));
     const result = { items };
     cache.set(cacheKey, result, 1800);
@@ -225,25 +210,20 @@ app.get('/api/trending', async (req, res) => {
   }
 });
 
-// Get video details
 app.get('/api/video/:id', async (req, res) => {
   const { id } = req.params;
   const cacheKey = `video_${id}`;
   const cached = cache.get(cacheKey);
   if (cached) return res.json(cached);
-
   try {
     const response = await youtube.videos.list({
-      part: 'snippet,statistics,contentDetails',
-      id
+      part: 'snippet,statistics,contentDetails', id
     });
     if (!response.data.items?.length) return res.status(404).json({ error: 'Not found' });
     const item = response.data.items[0];
     const result = {
-      id,
-      title: item.snippet.title,
-      channel: item.snippet.channelTitle,
-      channelId: item.snippet.channelId,
+      id, title: item.snippet.title,
+      channel: item.snippet.channelTitle, channelId: item.snippet.channelId,
       thumbnail: item.snippet.thumbnails?.maxres?.url || item.snippet.thumbnails?.high?.url,
       publishedAt: item.snippet.publishedAt,
       description: item.snippet.description,
@@ -255,6 +235,48 @@ app.get('/api/video/:id', async (req, res) => {
     res.json(result);
   } catch (err) {
     res.status(500).json({ error: err.message });
+  }
+});
+
+// ─── Direct Download Route (no middleman) ─────────────────────────────────────
+// Uses ytdl-core or yt-dlp if available, otherwise returns direct stream URL
+app.get('/api/download/:videoId', async (req, res) => {
+  const { videoId } = req.params;
+  const { format = 'mp3' } = req.query;
+
+  try {
+    // Try yt-dlp first
+    const { exec } = await import('child_process');
+    const { promisify } = await import('util');
+    const execAsync = promisify(exec);
+
+    let cmd;
+    if (['mp3', 'wav', 'ogg'].includes(format)) {
+      cmd = `yt-dlp -x --audio-format ${format} --audio-quality 0 -o - "https://www.youtube.com/watch?v=${videoId}"`;
+    } else {
+      cmd = `yt-dlp -f "bestvideo[ext=mp4]+bestaudio[ext=m4a]/best[ext=mp4]" -o - "https://www.youtube.com/watch?v=${videoId}"`;
+    }
+
+    res.setHeader('Content-Disposition', `attachment; filename="nova_${videoId}.${format}"`);
+    res.setHeader('Content-Type', format === 'mp4' ? 'video/mp4' : 'audio/mpeg');
+
+    const { spawn } = await import('child_process');
+    const ytdlp = spawn('yt-dlp', [
+      '-x', '--audio-format', format,
+      '--audio-quality', '0',
+      '-o', '-',
+      `https://www.youtube.com/watch?v=${videoId}`
+    ]);
+
+    ytdlp.stdout.pipe(res);
+    ytdlp.stderr.on('data', () => {});
+    ytdlp.on('error', () => {
+      if (!res.headersSent) res.status(500).json({ error: 'yt-dlp not available' });
+    });
+    req.on('close', () => ytdlp.kill());
+
+  } catch (err) {
+    res.status(500).json({ error: 'Download not available on server' });
   }
 });
 
@@ -273,7 +295,7 @@ app.put('/api/user/settings', requireAuth, (req, res) => {
 app.get('/api/playlists', requireAuth, (req, res) => {
   const db = loadData();
   const userId = req.session.user.id;
-  const userPlaylists = Object.values(db.playlists).filter(p => p.userId === userId);
+  const userPlaylists = Object.values(db.playlists).filter(p => p.userId === userId && !p.isSystem);
   res.json({ playlists: userPlaylists });
 });
 
@@ -285,10 +307,8 @@ app.post('/api/playlists', requireAuth, (req, res) => {
     id, name, description: description || '',
     coverColor: coverColor || '#00d4ff',
     userId: req.session.user.id,
-    tracks: [],
-    createdAt: new Date().toISOString(),
-    isPublic: false,
-    shareId: uuidv4()
+    tracks: [], createdAt: new Date().toISOString(),
+    isPublic: false, shareId: uuidv4()
   };
   db.playlists[id] = playlist;
   saveData(db);
@@ -347,7 +367,6 @@ app.delete('/api/playlists/:id/tracks/:trackId', requireAuth, (req, res) => {
   res.json({ playlist });
 });
 
-// Share playlist
 app.post('/api/playlists/:id/share', requireAuth, (req, res) => {
   const db = loadData();
   const playlist = db.playlists[req.params.id];
@@ -356,7 +375,7 @@ app.post('/api/playlists/:id/share', requireAuth, (req, res) => {
   playlist.isPublic = true;
   if (!playlist.shareId) playlist.shareId = uuidv4();
   saveData(db);
-  res.json({ shareUrl: `https://nova-music-frontend.vercel.app/shared/${playlist.shareId}`, shareId: playlist.shareId });
+  res.json({ shareUrl: `${FRONTEND_URL}/shared/${playlist.shareId}`, shareId: playlist.shareId });
 });
 
 app.get('/api/shared/:shareId', (req, res) => {
@@ -366,21 +385,18 @@ app.get('/api/shared/:shareId', (req, res) => {
   res.json({ playlist });
 });
 
-// Liked songs
 app.get('/api/liked', requireAuth, (req, res) => {
   const db = loadData();
-  const userId = req.session.user.id;
-  const liked = db.playlists[`liked_${userId}`];
+  const liked = db.playlists[`liked_${req.session.user.id}`];
   res.json({ tracks: liked?.tracks || [] });
 });
 
 app.post('/api/liked', requireAuth, (req, res) => {
   const { track } = req.body;
   const db = loadData();
-  const userId = req.session.user.id;
-  const key = `liked_${userId}`;
+  const key = `liked_${req.session.user.id}`;
   if (!db.playlists[key]) {
-    db.playlists[key] = { id: key, name: 'Liked Songs', userId, tracks: [], isSystem: true };
+    db.playlists[key] = { id: key, name: 'Liked Songs', userId: req.session.user.id, tracks: [], isSystem: true };
   }
   if (!db.playlists[key].tracks.find(t => t.id === track.id)) {
     db.playlists[key].tracks.push({ ...track, addedAt: new Date().toISOString() });
@@ -399,150 +415,8 @@ app.delete('/api/liked/:trackId', requireAuth, (req, res) => {
   res.json({ ok: true });
 });
 
-// ─── Download Route ────────────────────────────────────────────────────────────
-// Requires: pip install yt-dlp  AND  ffmpeg installed on system PATH
-app.get('/api/download', requireAuth, async (req, res) => {
-  const { videoId, format = 'mp3', quality = '192' } = req.query;
-  if (!videoId) return res.status(400).json({ error: 'videoId required' });
-
-  try {
-    const { execFile } = await import('child_process');
-    const os = await import('os');
-    const tmpDir = os.tmpdir();
-    const outTemplate = path.join(tmpDir, `nova_${videoId}_%(title)s.%(ext)s`);
-    const url = `https://www.youtube.com/watch?v=${videoId}`;
-
-    let ytdlpArgs = [];
-
-    if (format === 'mp4' || format === 'webm') {
-      // Video download
-      const heightMap = { '1080': 1080, '720': 720, '480': 480 };
-      const height = heightMap[quality] || 720;
-      ytdlpArgs = [
-        url,
-        '-f', `bestvideo[height<=${height}][ext=${format}]+bestaudio/best[height<=${height}]`,
-        '--merge-output-format', format,
-        '-o', outTemplate,
-        '--no-playlist'
-      ];
-    } else {
-      // Audio download
-      const bitrateMap = { '320': '320K', '192': '192K', '128': '128K', 'best': '0', 'high': '256K', 'medium': '128K' };
-      const bitrate = bitrateMap[quality] || '192K';
-      const audioCodec = format === 'wav' ? 'wav' : format === 'ogg' ? 'vorbis' : 'mp3';
-      ytdlpArgs = [
-        url,
-        '-x',
-        '--audio-format', format === 'wav' ? 'wav' : format === 'ogg' ? 'vorbis' : 'mp3',
-        '--audio-quality', bitrate,
-        '-o', outTemplate,
-        '--no-playlist'
-      ];
-    }
-
-    // Run yt-dlp
-    await new Promise((resolve, reject) => {
-      execFile('yt-dlp', ytdlpArgs, { timeout: 120000 }, (err, stdout, stderr) => {
-        if (err) reject(new Error(`yt-dlp failed: ${stderr || err.message}`));
-        else resolve(stdout);
-      });
-    });
-
-    // Find the downloaded file
-    const files = fs.readdirSync(tmpDir).filter(f => f.startsWith(`nova_${videoId}_`));
-    if (!files.length) return res.status(500).json({ error: 'File not found after download' });
-
-    const filePath = path.join(tmpDir, files[0]);
-    const filename = files[0].replace(`nova_${videoId}_`, '');
-
-    res.setHeader('Content-Disposition', `attachment; filename="${filename}"`);
-    res.setHeader('Content-Type', format === 'mp4' ? 'video/mp4' : format === 'wav' ? 'audio/wav' : format === 'ogg' ? 'audio/ogg' : 'audio/mpeg');
-
-    const stream = fs.createReadStream(filePath);
-    stream.pipe(res);
-    stream.on('end', () => {
-      // Clean up temp file
-      try { fs.unlinkSync(filePath); } catch {}
-    });
-
-  } catch (err) {
-    console.error('Download error:', err.message);
-    res.status(500).json({ 
-      error: 'Download failed', 
-      message: err.message.includes('yt-dlp') 
-        ? 'yt-dlp not installed. Run: pip install yt-dlp' 
-        : err.message 
-    });
-  }
-});
-
-// ─── 8D Audio Stream Route ─────────────────────────────────────────────────────
-// Requires: yt-dlp + ffmpeg installed
-// This streams YouTube audio processed with TRUE 8D binaural effects via ffmpeg
-app.get('/api/stream8d/:videoId', requireAuth, async (req, res) => {
-  const { videoId } = req.params;
-  if (!videoId) return res.status(400).json({ error: 'videoId required' });
-
-  try {
-    const { spawn, execFile } = await import('child_process');
-
-    // First get the direct audio URL from yt-dlp
-    const audioUrl = await new Promise((resolve, reject) => {
-      execFile('yt-dlp', [
-        `https://www.youtube.com/watch?v=${videoId}`,
-        '-x', '-g', '--audio-format', 'mp3', '--no-playlist'
-      ], { timeout: 30000 }, (err, stdout) => {
-        if (err) reject(err);
-        else resolve(stdout.trim().split('\n')[0]);
-      });
-    });
-
-    // Set headers for audio streaming
-    res.setHeader('Content-Type', 'audio/mpeg');
-    res.setHeader('Transfer-Encoding', 'chunked');
-    res.setHeader('Cache-Control', 'no-cache');
-
-    // ffmpeg 8D audio processing chain:
-    // apulsator    = tremolo LFO rotation (0.08 Hz = slow pan)
-    // aecho        = reverb simulation (concert hall)
-    // equalizer    = bass boost at 60Hz
-    // stereotools  = stereo widening
-    // loudnorm     = normalize output volume
-    const ffmpeg = spawn('ffmpeg', [
-      '-i', audioUrl,
-      '-af', [
-        'apulsator=hz=0.08:offset=0',           // 8D rotation LFO
-        'aecho=1.0:0.7:60:0.25',                // room reverb
-        'equalizer=f=60:t=o:w=2:g=5',           // bass boost
-        'equalizer=f=8000:t=o:w=2:g=2',         // air boost (brightness)
-        'stereotools=mlev=0.03',                 // stereo width
-        'loudnorm=I=-16:TP=-1.5:LRA=11'         // normalize
-      ].join(','),
-      '-f', 'mp3',
-      '-ab', '192k',
-      'pipe:1'
-    ]);
-
-    ffmpeg.stdout.pipe(res);
-    ffmpeg.stderr.on('data', () => {}); // suppress ffmpeg logs
-    ffmpeg.on('error', err => {
-      console.error('ffmpeg error:', err.message);
-      if (!res.headersSent) res.status(500).json({ error: 'ffmpeg not installed' });
-    });
-    req.on('close', () => ffmpeg.kill('SIGKILL'));
-
-  } catch (err) {
-    console.error('8D stream error:', err.message);
-    res.status(500).json({ 
-      error: 'Streaming failed',
-      message: err.message.includes('yt-dlp') ? 'Install yt-dlp: pip install yt-dlp' : err.message
-    });
-  }
-});
-
 // ─── Start ─────────────────────────────────────────────────────────────────────
-const PORT = process.env.PORT || 3001;
+const PORT = process.env.PORT || 3000;
 app.listen(PORT, () => {
   console.log(`\n🎵 NOVA Backend running on http://localhost:${PORT}`);
-  console.log(`📋 Configure your API keys in .env file\n`);
 });
