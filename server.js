@@ -10,6 +10,7 @@ import fs from 'fs';
 import path from 'path';
 import { fileURLToPath } from 'url';
 import https from 'https';
+import fetch from 'node-fetch';
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 const app = express();
@@ -43,6 +44,79 @@ const SESSION_SECRET = process.env.SESSION_SECRET || 'nova_secret_2024';
 
 const oauth2Client = new OAuth2Client(GOOGLE_CLIENT_ID, GOOGLE_CLIENT_SECRET, REDIRECT_URI);
 const youtube = google.youtube({ version: 'v3', auth: YOUTUBE_API_KEY });
+
+// ─── Piped API instances (fallback list for reliability) ──────────────────────
+const PIPED_INSTANCES = [
+  'https://pipedapi.kavin.rocks',
+  'https://piped-api.garudalinux.org',
+  'https://api.piped.yt',
+  'https://pipedapi.reallyaweso.me',
+  'https://pipedapi.darkness.services',
+];
+
+// ─── Get audio stream URL from Piped API ──────────────────────────────────────
+async function getAudioStream(videoId) {
+  const cacheKey = `stream_${videoId}`;
+  const cached = cache.get(cacheKey);
+  if (cached) return cached;
+
+  for (const instance of PIPED_INSTANCES) {
+    try {
+      const res = await fetch(`${instance}/streams/${videoId}`, {
+        headers: { 'User-Agent': 'Mozilla/5.0' },
+        timeout: 8000,
+      });
+      if (!res.ok) continue;
+      const data = await res.json();
+
+      // Get best audio stream
+      const audioStreams = data.audioStreams || [];
+      const best = audioStreams
+        .filter(s => s.mimeType?.includes('audio'))
+        .sort((a, b) => (b.bitrate || 0) - (a.bitrate || 0))[0];
+
+      if (best?.url) {
+        const result = {
+          url: best.url,
+          mimeType: best.mimeType || 'audio/mp4',
+          bitrate: best.bitrate,
+          title: data.title,
+          uploader: data.uploader,
+          thumbnail: data.thumbnailUrl,
+          duration: data.duration,
+        };
+        cache.set(cacheKey, result, 3600); // cache 1 hour
+        return result;
+      }
+    } catch (e) {
+      continue; // try next instance
+    }
+  }
+
+  // Fallback: try ytdl-core
+  try {
+    const ytdl = await import('ytdl-core');
+    const info = await ytdl.default.getInfo(`https://www.youtube.com/watch?v=${videoId}`);
+    const format = ytdl.default.chooseFormat(info.formats, { quality: 'highestaudio', filter: 'audioonly' });
+    if (format?.url) {
+      const result = {
+        url: format.url,
+        mimeType: format.mimeType || 'audio/mp4',
+        bitrate: format.audioBitrate,
+        title: info.videoDetails.title,
+        uploader: info.videoDetails.author?.name,
+        thumbnail: info.videoDetails.thumbnails?.[0]?.url,
+        duration: parseInt(info.videoDetails.lengthSeconds),
+      };
+      cache.set(cacheKey, result, 1800);
+      return result;
+    }
+  } catch (e) {
+    console.error('ytdl-core fallback failed:', e.message);
+  }
+
+  return null;
+}
 
 // ─── Middleware ────────────────────────────────────────────────────────────────
 const allowedOrigins = [
@@ -130,7 +204,50 @@ app.post('/auth/logout', (req, res) => {
   res.json({ ok: true });
 });
 
-// ─── YouTube Search ────────────────────────────────────────────────────────────
+// ─── NEW: Get direct audio stream URL ─────────────────────────────────────────
+// This is the key endpoint for background play!
+app.get('/api/stream/:videoId', async (req, res) => {
+  const { videoId } = req.params;
+  try {
+    const stream = await getAudioStream(videoId);
+    if (!stream) return res.status(404).json({ error: 'Stream not found' });
+    res.json(stream);
+  } catch (err) {
+    res.status(500).json({ error: err.message });
+  }
+});
+
+// ─── NEW: Proxy audio stream (fixes CORS issues on some devices) ──────────────
+app.get('/api/proxy/:videoId', async (req, res) => {
+  const { videoId } = req.params;
+  try {
+    const stream = await getAudioStream(videoId);
+    if (!stream?.url) return res.status(404).json({ error: 'Not found' });
+
+    const audioRes = await fetch(stream.url, {
+      headers: {
+        'User-Agent': 'Mozilla/5.0',
+        'Range': req.headers.range || 'bytes=0-',
+      }
+    });
+
+    res.setHeader('Content-Type', stream.mimeType || 'audio/mp4');
+    res.setHeader('Accept-Ranges', 'bytes');
+    res.setHeader('Access-Control-Allow-Origin', '*');
+
+    if (audioRes.headers.get('content-length'))
+      res.setHeader('Content-Length', audioRes.headers.get('content-length'));
+    if (audioRes.headers.get('content-range'))
+      res.setHeader('Content-Range', audioRes.headers.get('content-range'));
+
+    res.status(audioRes.status);
+    audioRes.body.pipe(res);
+  } catch (err) {
+    res.status(500).json({ error: err.message });
+  }
+});
+
+// ─── YouTube Search (keep existing) ───────────────────────────────────────────
 app.get('/api/search', async (req, res) => {
   const { q, type = 'video', pageToken } = req.query;
   if (!q) return res.json({ items: [], nextPageToken: null });
@@ -235,48 +352,6 @@ app.get('/api/video/:id', async (req, res) => {
     res.json(result);
   } catch (err) {
     res.status(500).json({ error: err.message });
-  }
-});
-
-// ─── Direct Download Route (no middleman) ─────────────────────────────────────
-// Uses ytdl-core or yt-dlp if available, otherwise returns direct stream URL
-app.get('/api/download/:videoId', async (req, res) => {
-  const { videoId } = req.params;
-  const { format = 'mp3' } = req.query;
-
-  try {
-    // Try yt-dlp first
-    const { exec } = await import('child_process');
-    const { promisify } = await import('util');
-    const execAsync = promisify(exec);
-
-    let cmd;
-    if (['mp3', 'wav', 'ogg'].includes(format)) {
-      cmd = `yt-dlp -x --audio-format ${format} --audio-quality 0 -o - "https://www.youtube.com/watch?v=${videoId}"`;
-    } else {
-      cmd = `yt-dlp -f "bestvideo[ext=mp4]+bestaudio[ext=m4a]/best[ext=mp4]" -o - "https://www.youtube.com/watch?v=${videoId}"`;
-    }
-
-    res.setHeader('Content-Disposition', `attachment; filename="nova_${videoId}.${format}"`);
-    res.setHeader('Content-Type', format === 'mp4' ? 'video/mp4' : 'audio/mpeg');
-
-    const { spawn } = await import('child_process');
-    const ytdlp = spawn('yt-dlp', [
-      '-x', '--audio-format', format,
-      '--audio-quality', '0',
-      '-o', '-',
-      `https://www.youtube.com/watch?v=${videoId}`
-    ]);
-
-    ytdlp.stdout.pipe(res);
-    ytdlp.stderr.on('data', () => {});
-    ytdlp.on('error', () => {
-      if (!res.headersSent) res.status(500).json({ error: 'yt-dlp not available' });
-    });
-    req.on('close', () => ytdlp.kill());
-
-  } catch (err) {
-    res.status(500).json({ error: 'Download not available on server' });
   }
 });
 
