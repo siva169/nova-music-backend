@@ -3,13 +3,13 @@ import express from 'express';
 import cors from 'cors';
 import session from 'express-session';
 import { OAuth2Client } from 'google-auth-library';
-import { google } from 'googleapis';
 import NodeCache from 'node-cache';
 import { v4 as uuidv4 } from 'uuid';
 import fs from 'fs';
 import path from 'path';
 import { fileURLToPath } from 'url';
 import https from 'https';
+import CryptoJS from 'crypto-js';
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 const app = express();
@@ -42,7 +42,6 @@ const FRONTEND_URL = process.env.NODE_ENV === 'production'
 const SESSION_SECRET = process.env.SESSION_SECRET || 'nova_secret_2024';
 
 const oauth2Client = new OAuth2Client(GOOGLE_CLIENT_ID, GOOGLE_CLIENT_SECRET, REDIRECT_URI);
-const youtube = google.youtube({ version: 'v3', auth: YOUTUBE_API_KEY });
 
 // ─── Middleware ────────────────────────────────────────────────────────────────
 const allowedOrigins = [
@@ -130,79 +129,86 @@ app.post('/auth/logout', (req, res) => {
   res.json({ ok: true });
 });
 
-// ─── YouTube Search ────────────────────────────────────────────────────────────
-app.get('/api/search', async (req, res) => {
-  const { q, type = 'video', pageToken } = req.query;
-  if (!q) return res.json({ items: [], nextPageToken: null });
-
-  const cacheKey = `search_${q}_${type}_${pageToken || ''}`;
-  const cached = cache.get(cacheKey);
-  if (cached) return res.json(cached);
-
+// Helper for JioSaavn decryption
+function decryptSaavnUrl(encryptedUrl) {
   try {
-    const response = await youtube.search.list({
-      part: 'snippet', q, type: 'video',
-      maxResults: 20, order: 'relevance',
-      pageToken: pageToken || undefined
-    });
-    const items = response.data.items.map(item => ({
-      id: item.id.videoId,
-      title: item.snippet.title,
-      channel: item.snippet.channelTitle,
-      channelId: item.snippet.channelId,
-      thumbnail: item.snippet.thumbnails?.high?.url || item.snippet.thumbnails?.default?.url,
-      publishedAt: item.snippet.publishedAt,
-      description: item.snippet.description
-    }));
-    const result = { items, nextPageToken: response.data.nextPageToken || null };
-    cache.set(cacheKey, result);
-    res.json(result);
+    const key = CryptoJS.enc.Utf8.parse('38346591');
+    const dec = CryptoJS.DES.decrypt(
+      { ciphertext: CryptoJS.enc.Base64.parse(encryptedUrl) },
+      key,
+      { mode: CryptoJS.mode.ECB, padding: CryptoJS.pad.Pkcs7 }
+    );
+    return dec.toString(CryptoJS.enc.Utf8).replace('_96.mp4', '_320.mp4');
+  } catch (err) {
+    return null;
+  }
+}
+
+// ─── JioSaavn Search & Endpoints ───────────────────────────────────────────────
+app.get('/api/search', async (req, res) => {
+  const { q } = req.query;
+  if (!q) return res.json({ items: [] });
+  try {
+    const searchRes = await fetch(`https://www.jiosaavn.com/api.php?__call=search.getResults&q=${encodeURIComponent(q)}&n=20&p=1&_format=json&_marker=0&ctx=web6dot0`);
+    const searchData = await searchRes.json();
+    if (!searchData.results || !searchData.results.length) return res.json({ items: [] });
+    
+    // Fetch precise song details needed for duration & streaming urls
+    const pids = searchData.results.map(r => r.id).join(',');
+    const detailRes = await fetch(`https://www.jiosaavn.com/api.php?__call=song.getDetails&pids=${pids}&_format=json&_marker=0&ctx=web6dot0`);
+    const detailData = await detailRes.json();
+    
+    const items = [];
+    for (const key in detailData) {
+      const song = detailData[key];
+      if (!song || !song.encrypted_media_url) continue;
+      const streamUrl = decryptSaavnUrl(song.encrypted_media_url);
+      items.push({
+        id: song.id,
+        title: song.song,
+        channel: song.primary_artists || song.singers,
+        channelId: song.primary_artists_id,
+        thumbnail: song.image.replace('150x150', '500x500'),
+        publishedAt: song.year,
+        description: song.album,
+        duration: parseInt(song.duration, 10),
+        streamUrl
+      });
+    }
+    
+    res.json({ items, nextPageToken: null });
   } catch (err) {
     res.status(500).json({ error: 'Search failed', message: err.message });
   }
 });
 
 app.get('/api/search/channel', async (req, res) => {
-  const { channelName, pageToken } = req.query;
-  if (!channelName) return res.json({ items: [] });
-  try {
-    const channelRes = await youtube.search.list({
-      part: 'snippet', q: channelName, type: 'channel', maxResults: 1
-    });
-    if (!channelRes.data.items?.length) return res.json({ items: [] });
-    const channelId = channelRes.data.items[0].id.channelId;
-    const videosRes = await youtube.search.list({
-      part: 'snippet', channelId, type: 'video', maxResults: 20,
-      order: 'date', pageToken: pageToken || undefined
-    });
-    const items = videosRes.data.items.map(item => ({
-      id: item.id.videoId, title: item.snippet.title,
-      channel: item.snippet.channelTitle, channelId: item.snippet.channelId,
-      thumbnail: item.snippet.thumbnails?.high?.url,
-      publishedAt: item.snippet.publishedAt
-    }));
-    res.json({ items, nextPageToken: videosRes.data.nextPageToken || null });
-  } catch (err) {
-    res.status(500).json({ error: err.message });
-  }
+  res.json({ items: [] }); // Compatibility stub
 });
 
 app.get('/api/trending', async (req, res) => {
-  const cacheKey = 'trending_music';
+  const cacheKey = 'trending_saavn';
   const cached = cache.get(cacheKey);
   if (cached) return res.json(cached);
   try {
-    const response = await youtube.videos.list({
-      part: 'snippet,statistics', chart: 'mostPopular',
-      videoCategoryId: '10', maxResults: 24, regionCode: 'IN'
-    });
-    const items = response.data.items.map(item => ({
-      id: item.id, title: item.snippet.title,
-      channel: item.snippet.channelTitle, channelId: item.snippet.channelId,
-      thumbnail: item.snippet.thumbnails?.high?.url,
-      publishedAt: item.snippet.publishedAt, viewCount: item.statistics?.viewCount
+    const chartRes = await fetch('https://www.jiosaavn.com/api.php?__call=webapi.getLaunchData&_format=json&_marker=0&ctx=web6dot0');
+    const chartData = await chartRes.json();
+    const topPlaylist = chartData.charts?.[0] || chartData.new_trending?.[0];
+    if (!topPlaylist) return res.json({ items: [] });
+    
+    const plRes = await fetch(`https://www.jiosaavn.com/api.php?__call=playlist.getDetails&listid=${topPlaylist.listid || topPlaylist.id}&_format=json&_marker=0&ctx=web6dot0`);
+    const plData = await plRes.json();
+    
+    const items = (plData.list || []).map(song => ({
+      id: song.id,
+      title: song.title || song.song,
+      channel: song.subtitle || song.primary_artists,
+      thumbnail: song.image?.replace('150x150', '500x500'),
+      duration: parseInt(song.duration || 0, 10) || 0,
+      streamUrl: song.encrypted_media_url ? decryptSaavnUrl(song.encrypted_media_url) : null
     }));
-    const result = { items };
+    
+    const result = { items: items.filter(i => i.streamUrl) };
     cache.set(cacheKey, result, 1800);
     res.json(result);
   } catch (err) {
@@ -212,71 +218,23 @@ app.get('/api/trending', async (req, res) => {
 
 app.get('/api/video/:id', async (req, res) => {
   const { id } = req.params;
-  const cacheKey = `video_${id}`;
-  const cached = cache.get(cacheKey);
-  if (cached) return res.json(cached);
   try {
-    const response = await youtube.videos.list({
-      part: 'snippet,statistics,contentDetails', id
-    });
-    if (!response.data.items?.length) return res.status(404).json({ error: 'Not found' });
-    const item = response.data.items[0];
+    const detailRes = await fetch(`https://www.jiosaavn.com/api.php?__call=song.getDetails&pids=${id}&_format=json&_marker=0&ctx=web6dot0`);
+    const detailData = await detailRes.json();
+    const song = Object.values(detailData)[0];
+    if (!song) return res.status(404).json({ error: 'Not found' });
+    
     const result = {
-      id, title: item.snippet.title,
-      channel: item.snippet.channelTitle, channelId: item.snippet.channelId,
-      thumbnail: item.snippet.thumbnails?.maxres?.url || item.snippet.thumbnails?.high?.url,
-      publishedAt: item.snippet.publishedAt,
-      description: item.snippet.description,
-      duration: item.contentDetails?.duration,
-      viewCount: item.statistics?.viewCount,
-      likeCount: item.statistics?.likeCount
+      id: song.id, title: song.song,
+      channel: song.primary_artists || song.singers,
+      thumbnail: song.image.replace('150x150', '500x500'),
+      description: song.album,
+      duration: parseInt(song.duration, 10),
+      streamUrl: decryptSaavnUrl(song.encrypted_media_url)
     };
-    cache.set(cacheKey, result);
     res.json(result);
   } catch (err) {
     res.status(500).json({ error: err.message });
-  }
-});
-
-// ─── Direct Download Route (no middleman) ─────────────────────────────────────
-// Uses ytdl-core or yt-dlp if available, otherwise returns direct stream URL
-app.get('/api/download/:videoId', async (req, res) => {
-  const { videoId } = req.params;
-  const { format = 'mp3' } = req.query;
-
-  try {
-    // Try yt-dlp first
-    const { exec } = await import('child_process');
-    const { promisify } = await import('util');
-    const execAsync = promisify(exec);
-
-    let cmd;
-    if (['mp3', 'wav', 'ogg'].includes(format)) {
-      cmd = `yt-dlp -x --audio-format ${format} --audio-quality 0 -o - "https://www.youtube.com/watch?v=${videoId}"`;
-    } else {
-      cmd = `yt-dlp -f "bestvideo[ext=mp4]+bestaudio[ext=m4a]/best[ext=mp4]" -o - "https://www.youtube.com/watch?v=${videoId}"`;
-    }
-
-    res.setHeader('Content-Disposition', `attachment; filename="nova_${videoId}.${format}"`);
-    res.setHeader('Content-Type', format === 'mp4' ? 'video/mp4' : 'audio/mpeg');
-
-    const { spawn } = await import('child_process');
-    const ytdlp = spawn('yt-dlp', [
-      '-x', '--audio-format', format,
-      '--audio-quality', '0',
-      '-o', '-',
-      `https://www.youtube.com/watch?v=${videoId}`
-    ]);
-
-    ytdlp.stdout.pipe(res);
-    ytdlp.stderr.on('data', () => {});
-    ytdlp.on('error', () => {
-      if (!res.headersSent) res.status(500).json({ error: 'yt-dlp not available' });
-    });
-    req.on('close', () => ytdlp.kill());
-
-  } catch (err) {
-    res.status(500).json({ error: 'Download not available on server' });
   }
 });
 
@@ -417,6 +375,7 @@ app.delete('/api/liked/:trackId', requireAuth, (req, res) => {
 
 // ─── Start ─────────────────────────────────────────────────────────────────────
 const PORT = process.env.PORT || 3000;
-app.listen(PORT, () => {
-  console.log(`\n🎵 NOVA Backend running on http://localhost:${PORT}`);
+
+app.listen(PORT, async () => {
+  console.log(`\n🎵 NOVA Premium Backend running on http://localhost:${PORT}`);
 });
