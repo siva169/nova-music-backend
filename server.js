@@ -159,8 +159,8 @@ app.get('/api/search', async (req, res) => {
     const detailData = await detailRes.json();
     
     const items = [];
-    for (const key in detailData) {
-      const song = detailData[key];
+    const songs = detailData.songs || [];
+    for (const song of songs) {
       if (!song || !song.encrypted_media_url) continue;
       const streamUrl = decryptSaavnUrl(song.encrypted_media_url);
       items.push({
@@ -199,7 +199,7 @@ app.get('/api/trending', async (req, res) => {
     const plRes = await fetch(`https://www.jiosaavn.com/api.php?__call=playlist.getDetails&listid=${topPlaylist.listid || topPlaylist.id}&_format=json&_marker=0&ctx=web6dot0`);
     const plData = await plRes.json();
     
-    const items = (plData.list || []).map(song => ({
+    const items = (plData.songs || []).map(song => ({
       id: song.id,
       title: song.title || song.song,
       channel: song.subtitle || song.primary_artists,
@@ -221,7 +221,7 @@ app.get('/api/video/:id', async (req, res) => {
   try {
     const detailRes = await fetch(`https://www.jiosaavn.com/api.php?__call=song.getDetails&pids=${id}&_format=json&_marker=0&ctx=web6dot0`);
     const detailData = await detailRes.json();
-    const song = Object.values(detailData)[0];
+    const song = (detailData.songs || [])[0];
     if (!song) return res.status(404).json({ error: 'Not found' });
     
     const result = {
