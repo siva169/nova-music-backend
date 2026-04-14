@@ -144,6 +144,71 @@ function decryptSaavnUrl(encryptedUrl) {
   }
 }
 
+// Build a proxied stream URL (avoids CORS blocking in browser)
+const BACKEND_URL = process.env.NODE_ENV === 'production'
+  ? 'https://nova-music-backend-production.up.railway.app'
+  : 'http://localhost:3001';
+
+function proxyStreamUrl(encryptedUrl, id) {
+  if (!encryptedUrl) return null;
+  // Store decrypted URL in a short-lived cache keyed by id so proxy can look it up
+  const raw = decryptSaavnUrl(encryptedUrl);
+  if (!raw) return null;
+  cache.set(`stream_${id}`, raw, 3600);
+  return `${BACKEND_URL}/api/stream/${id}`;
+}
+
+// ─── Audio Stream Proxy (solves CORS) ────────────────────────────────────────
+app.get('/api/stream/:id', async (req, res) => {
+  const { id } = req.params;
+  let cdnUrl = cache.get(`stream_${id}`);
+
+  // Re-fetch from Saavn if not cached
+  if (!cdnUrl) {
+    try {
+      const detailRes = await fetch(`https://www.jiosaavn.com/api.php?__call=song.getDetails&pids=${id}&_format=json&_marker=0&ctx=web6dot0`);
+      const detailData = await detailRes.json();
+      const song = (detailData.songs || [])[0];
+      if (!song) return res.status(404).send('Not found');
+      cdnUrl = decryptSaavnUrl(song.encrypted_media_url);
+      if (cdnUrl) cache.set(`stream_${id}`, cdnUrl, 3600);
+    } catch { return res.status(500).send('Failed to resolve stream'); }
+  }
+
+  if (!cdnUrl) return res.status(404).send('Stream URL not available');
+
+  try {
+    // Support range requests for seeking
+    const headers = { 'User-Agent': 'Mozilla/5.0', 'Referer': 'https://www.jiosaavn.com/' };
+    if (req.headers.range) headers['Range'] = req.headers.range;
+
+    const upstream = await fetch(cdnUrl, { headers });
+    const status = req.headers.range ? 206 : 200;
+
+    res.writeHead(status, {
+      'Content-Type': upstream.headers.get('Content-Type') || 'audio/mp4',
+      'Content-Length': upstream.headers.get('Content-Length') || '',
+      'Content-Range': upstream.headers.get('Content-Range') || '',
+      'Accept-Ranges': 'bytes',
+      'Cache-Control': 'no-cache',
+    });
+
+    const reader = upstream.body.getReader();
+    const pump = async () => {
+      while (true) {
+        const { done, value } = await reader.read();
+        if (done) { res.end(); break; }
+        if (!res.write(value)) await new Promise(r => res.once('drain', r));
+      }
+    };
+    pump().catch(() => res.end());
+    req.on('close', () => reader.cancel());
+  } catch (err) {
+    if (!res.headersSent) res.status(500).send('Stream proxy error');
+  }
+});
+
+
 // ─── JioSaavn Search & Endpoints ───────────────────────────────────────────────
 app.get('/api/search', async (req, res) => {
   const { q } = req.query;
@@ -162,7 +227,7 @@ app.get('/api/search', async (req, res) => {
     const songs = detailData.songs || [];
     for (const song of songs) {
       if (!song || !song.encrypted_media_url) continue;
-      const streamUrl = decryptSaavnUrl(song.encrypted_media_url);
+      const streamUrl = proxyStreamUrl(song.encrypted_media_url, song.id);
       items.push({
         id: song.id,
         title: song.song,
@@ -191,24 +256,45 @@ app.get('/api/trending', async (req, res) => {
   const cached = cache.get(cacheKey);
   if (cached) return res.json(cached);
   try {
-    const chartRes = await fetch('https://www.jiosaavn.com/api.php?__call=webapi.getLaunchData&_format=json&_marker=0&ctx=web6dot0');
+    // Fetch top Bollywood/Global chart directly
+    const chartRes = await fetch('https://www.jiosaavn.com/api.php?__call=content.getBrowseModules&_format=json&_marker=0&ctx=web6dot0&api_version=4');
     const chartData = await chartRes.json();
-    const topPlaylist = chartData.charts?.[0] || chartData.new_trending?.[0];
-    if (!topPlaylist) return res.json({ items: [] });
-    
-    const plRes = await fetch(`https://www.jiosaavn.com/api.php?__call=playlist.getDetails&listid=${topPlaylist.listid || topPlaylist.id}&_format=json&_marker=0&ctx=web6dot0`);
-    const plData = await plRes.json();
-    
-    const items = (plData.songs || []).map(song => ({
-      id: song.id,
-      title: song.title || song.song,
-      channel: song.subtitle || song.primary_artists,
-      thumbnail: song.image?.replace('150x150', '500x500'),
-      duration: parseInt(song.duration || 0, 10) || 0,
-      streamUrl: song.encrypted_media_url ? decryptSaavnUrl(song.encrypted_media_url) : null
-    }));
-    
-    const result = { items: items.filter(i => i.streamUrl) };
+
+    // Try to find trending songs list
+    let songs = [];
+    const topCharts = chartData?.trending?.songs || chartData?.charts;
+    if (topCharts && topCharts.length > 0) {
+      const chart = topCharts[0];
+      const plId = chart.id || chart.listid;
+      const plRes = await fetch(`https://www.jiosaavn.com/api.php?__call=playlist.getDetails&listid=${plId}&_format=json&_marker=0&ctx=web6dot0`);
+      const plData = await plRes.json();
+      songs = plData.songs || [];
+    }
+
+    // Fallback: top Bollywood hits by search
+    if (!songs.length) {
+      const srRes = await fetch('https://www.jiosaavn.com/api.php?__call=search.getResults&q=top%20bollywood%20hits%202024&n=20&p=1&_format=json&_marker=0&ctx=web6dot0');
+      const srData = await srRes.json();
+      const pids = (srData.results || []).map(r => r.id).join(',');
+      if (pids) {
+        const detRes = await fetch(`https://www.jiosaavn.com/api.php?__call=song.getDetails&pids=${pids}&_format=json&_marker=0&ctx=web6dot0`);
+        const detData = await detRes.json();
+        songs = detData.songs || [];
+      }
+    }
+
+    const items = songs
+      .filter(song => song && song.encrypted_media_url)
+      .map(song => ({
+        id: song.id,
+        title: song.song || song.title,
+        channel: song.primary_artists || song.singers || song.subtitle,
+        thumbnail: (song.image || '').replace('150x150', '500x500'),
+        duration: parseInt(song.duration || 0, 10) || 0,
+        streamUrl: proxyStreamUrl(song.encrypted_media_url, song.id)
+      }));
+
+    const result = { items };
     cache.set(cacheKey, result, 1800);
     res.json(result);
   } catch (err) {
@@ -230,7 +316,7 @@ app.get('/api/video/:id', async (req, res) => {
       thumbnail: song.image.replace('150x150', '500x500'),
       description: song.album,
       duration: parseInt(song.duration, 10),
-      streamUrl: decryptSaavnUrl(song.encrypted_media_url)
+      streamUrl: proxyStreamUrl(song.encrypted_media_url, song.id)
     };
     res.json(result);
   } catch (err) {
